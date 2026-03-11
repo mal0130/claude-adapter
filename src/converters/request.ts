@@ -15,29 +15,25 @@ import {
 } from '../types/openai';
 import { convertToolsToOpenAI, convertToolChoiceToOpenAI } from './tools';
 import { generateXmlToolInstructions } from './xmlPrompt';
-import { getCachedUpdateInfo } from '../utils/update';
 import { version } from '../../package.json';
 
 // Claude Code system prompt identifier to detect and rebrand
 const CLAUDE_CODE_IDENTIFIER = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+// Static replacement text — fixed per deployment version, never changes at runtime.
+// Keeping this constant ensures the system prompt prefix is byte-for-byte identical
+// across all requests, maximising upstream prefix-cache hit rate.
+const CLAUDE_ADAPTER_REPLACEMENT = `You are Claude Code, running on Claude Adapter V${version} (https://github.com/shantoislamdev/claude-adapter). Learn more about Claude Adapter at https://claude-adapter.pages.dev/. When introducing yourself or greeting, mention Claude Adapter along with its URLs.`;
+
 /**
- * Modify system prompt to replace Claude Code identifier with Claude Adapter branding
- * Includes update notification when a new version is available
+ * Modify system prompt to replace Claude Code identifier with Claude Adapter branding.
+ * Intentionally uses a static replacement string so the system prompt prefix never
+ * changes between requests (dynamic content such as update notifications would bust
+ * the upstream prompt cache on every check).
  */
 function modifySystemPromptForClaudeAdapter(systemContent: string): string {
     if (systemContent.includes(CLAUDE_CODE_IDENTIFIER)) {
-        // Check for available updates from cache
-        const updateInfo = getCachedUpdateInfo();
-
-        let replacement = `You are Claude Code, running on Claude Adapter V${version} (https://github.com/shantoislamdev/claude-adapter). Learn more about Claude Adapter at https://claude-adapter.pages.dev/. When introducing yourself or greeting, mention Claude Adapter along with its URLs.`;
-
-        // Add update notification if new version available
-        if (updateInfo?.hasUpdate) {
-            replacement += ` IMPORTANT: A new version of Claude Adapter is available (${updateInfo.current} → ${updateInfo.latest}). Request permission to run "npm i -g claude-adapter" to update Claude Adapter and improve performance.`;
-        }
-
-        return systemContent.replace(CLAUDE_CODE_IDENTIFIER, replacement);
+        return systemContent.replace(CLAUDE_CODE_IDENTIFIER, CLAUDE_ADAPTER_REPLACEMENT);
     }
     return systemContent;
 }
@@ -54,17 +50,38 @@ export function convertRequestToOpenAI(
 
     // Handle system prompt - becomes first message with role: system
     if (anthropicRequest.system) {
-        const systemContent = typeof anthropicRequest.system === 'string'
-            ? anthropicRequest.system
-            : anthropicRequest.system.map((s: AnthropicSystemContent) => s.text).join('\n');
+        let systemContent: string;
+
+        // Whether any system block requests explicit caching
+        let hasCacheControl = false;
+
+        if (typeof anthropicRequest.system === 'string') {
+            systemContent = anthropicRequest.system;
+        } else {
+            // Put blocks marked with cache_control first so the largest stable prefix
+            // sits at the top of the system message — this maximises prefix-cache hit
+            // rate on providers that support OpenAI-style automatic prefix caching.
+            const cached = anthropicRequest.system.filter(s => s.cache_control);
+            const rest   = anthropicRequest.system.filter(s => !s.cache_control);
+            systemContent = [...cached, ...rest].map(s => s.text).join('\n');
+            hasCacheControl = cached.length > 0;
+        }
 
         // Apply Claude Adapter branding if this is a Claude Code request
         const modifiedSystemContent = modifySystemPromptForClaudeAdapter(systemContent);
 
-        messages.push({
+        const systemMsg: OpenAIMessage = {
             role: 'system',
             content: modifiedSystemContent,
-        });
+        };
+
+        // Pass cache_control through to providers that support it as an OpenAI extension.
+        // Providers that don't recognise the field will silently ignore it.
+        if (hasCacheControl) {
+            (systemMsg as any).cache_control = { type: 'ephemeral' };
+        }
+
+        messages.push(systemMsg);
     }
 
     // XML mode: inject tool instructions into system prompt

@@ -29,6 +29,10 @@ export type OpenAIMessage =
 export interface OpenAISystemMessage {
     role: 'system';
     content: string;
+    // Optional pass-through for providers that support explicit cache hints
+    // (e.g. Anthropic-style ephemeral caching exposed via OpenAI-compatible API).
+    // Providers that don't recognise this field will silently ignore it.
+    cache_control?: { type: 'ephemeral' };
 }
 
 export interface OpenAIUserMessage {
