@@ -5,7 +5,7 @@ import { AnthropicMessageRequest } from '../types/anthropic';
 import { AdapterConfig } from '../types/config';
 import { convertRequestToOpenAI } from '../converters/request';
 import { convertResponseToAnthropic, createErrorResponse } from '../converters/response';
-import { streamOpenAIToAnthropic } from '../converters/streaming';
+import { streamOpenAIToAnthropic, aggregateOpenAIStream } from '../converters/streaming';
 import { streamXmlOpenAIToAnthropic } from '../converters/xmlStreaming';
 import { validateAnthropicRequest, formatValidationErrors } from '../utils/validation';
 import { logger, RequestLogger } from '../utils/logger';
@@ -90,7 +90,9 @@ export function createMessagesHandler(config: AdapterConfig) {
 }
 
 /**
- * Handle non-streaming API request
+ * Handle non-streaming API request.
+ * Upstream is called with stream: true and the stream is aggregated so that
+ * upstreams that only support streaming still work when client sends stream: false.
  */
 async function handleNonStreamingRequest(
     openai: OpenAI,
@@ -100,19 +102,12 @@ async function handleNonStreamingRequest(
     provider: string,
     log: RequestLogger
 ): Promise<void> {
-    log.debug('Making non-streaming request');
-
-    const response = await openai.chat.completions.create({
+    const stream = await openai.chat.completions.create({
         ...openaiRequest,
-        stream: false,
-    });
+        stream: true,
+    } as OpenAI.ChatCompletionCreateParamsStreaming);
+    const response = await aggregateOpenAIStream(stream as any);
 
-    log.debug('Response received', {
-        finishReason: response.choices[0]?.finish_reason,
-        usage: response.usage
-    });
-
-    // Record token usage
     if (response.usage) {
         recordUsage({
             provider,
@@ -125,7 +120,7 @@ async function handleNonStreamingRequest(
         });
     }
 
-    const anthropicResponse = convertResponseToAnthropic(response as any, originalModel);
+    const anthropicResponse = convertResponseToAnthropic(response, originalModel);
     reply.send(anthropicResponse);
 }
 

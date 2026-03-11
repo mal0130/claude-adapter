@@ -5,7 +5,7 @@ import {
     AnthropicMessageResponse,
     AnthropicUsage,
 } from '../types/anthropic';
-import { OpenAIStreamChunk, OpenAIStreamToolCall } from '../types/openai';
+import { OpenAIChatResponse, OpenAIStreamChunk, OpenAIStreamToolCall } from '../types/openai';
 import { generateToolUseId } from './tools';
 import { recordUsage } from '../utils/tokenUsage';
 import { recordError } from '../utils/errorLog';
@@ -53,6 +53,73 @@ interface StreamingState {
     cachedInputTokens: number;
     hasStarted: boolean;
     textContent: string;
+}
+
+/**
+ * Consume OpenAI stream and return a single OpenAIChatResponse.
+ * Used when client sends stream: false but upstream only supports stream: true.
+ */
+export async function aggregateOpenAIStream(
+    openaiStream: Stream<OpenAIStreamChunk>
+): Promise<OpenAIChatResponse> {
+    let id = '';
+    let created = 0;
+    let model = '';
+    let content = '';
+    let finishReason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null = null;
+    const toolCallsMap = new Map<number, { id: string; name: string; arguments: string }>();
+    let usage: OpenAIChatResponse['usage'] = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
+    for await (const chunk of openaiStream) {
+        if (chunk.id) id = chunk.id;
+        if (chunk.created) created = chunk.created;
+        if (chunk.model) model = chunk.model;
+        if (chunk.usage) usage = chunk.usage;
+
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+
+        const delta = choice.delta;
+        if (delta.content) content += delta.content;
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+
+        if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+                const idx = tc.index;
+                if (!toolCallsMap.has(idx)) {
+                    const tid = tc.id && !usedToolIds.has(tc.id) ? tc.id : generateUniqueToolId();
+                    if (tc.id) usedToolIds.add(tid);
+                    toolCallsMap.set(idx, { id: tid, name: tc.function?.name ?? '', arguments: '' });
+                }
+                const cur = toolCallsMap.get(idx)!;
+                if (tc.function?.name) cur.name = tc.function.name;
+                if (tc.function?.arguments) cur.arguments += tc.function.arguments;
+            }
+        }
+    }
+
+    const toolCallsArray = Array.from(toolCallsMap.entries())
+        .sort(([a], [b]) => a - b)
+        .map(([, v]) => ({
+            id: v.id,
+            type: 'function' as const,
+            function: { name: v.name, arguments: v.arguments },
+        }));
+
+    const message: OpenAIChatResponse['choices'][0]['message'] = {
+        role: 'assistant',
+        content: content || null,
+    };
+    if (toolCallsArray.length > 0) (message as any).tool_calls = toolCallsArray;
+
+    return {
+        id,
+        object: 'chat.completion',
+        created,
+        model,
+        choices: [{ index: 0, message, finish_reason: finishReason }],
+        usage,
+    };
 }
 
 /**
