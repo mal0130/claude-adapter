@@ -283,6 +283,7 @@ function finishStream(state: BufferedState, raw: any): void {
         },
         usage: {
             output_tokens: state.outputTokens,
+            input_tokens: state.inputTokens,
             cache_read_input_tokens: state.cachedInputTokens,
         },
     };
